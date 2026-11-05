@@ -1,4 +1,4 @@
-# Copyright 2018 Jigsaw Operations LLC
+# Copyright 2018 The Outline Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@ project_name: outline-ss-server
 # Skip 32 bit macOS builds.
 builds:
   -
+    main: ./cmd/outline-ss-server
     env:
       - CGO_ENABLED=0
+      - GOWORK=off
     goos:
       - darwin
       - windows
@@ -61,3 +63,11 @@ changelog:
     exclude:
     - '^docs:'
     - '^test:'
+
+git:
+  # Sort tags by creation time when commit has more than one tag.
+  tag_sort: -version:creatordate
+
+  # Specify prerelease suffix while sorting tags if there are more than one tag
+  # in the same commit.
+  prerelease_suffix: "-rc"

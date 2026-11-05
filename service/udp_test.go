@@ -1,4 +1,4 @@
-// Copyright 2018 Jigsaw Operations LLC
+// Copyright 2018 The Outline Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,177 +16,274 @@ package service
 
 import (
 	"bytes"
-	"errors"
+	"context"
+	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
-	onet "github.com/Jigsaw-Code/outline-ss-server/net"
-	"github.com/Jigsaw-Code/outline-ss-server/service/metrics"
-	ss "github.com/Jigsaw-Code/outline-ss-server/shadowsocks"
 	logging "github.com/op/go-logging"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.getoutline.org/sdk/transport"
+	"golang.getoutline.org/sdk/transport/shadowsocks"
+
+	onet "golang.getoutline.org/tunnel-server/net"
 )
 
 const timeout = 5 * time.Minute
 
 var clientAddr = net.UDPAddr{IP: []byte{192, 0, 2, 1}, Port: 12345}
+
 var targetAddr = net.UDPAddr{IP: []byte{192, 0, 2, 2}, Port: 54321}
+var localAddr = net.UDPAddr{IP: []byte{127, 0, 0, 1}, Port: 9}
 var dnsAddr = net.UDPAddr{IP: []byte{192, 0, 2, 3}, Port: 53}
-var natCipher *ss.Cipher
+
+var natCryptoKey *shadowsocks.EncryptionKey
 
 func init() {
 	logging.SetLevel(logging.INFO, "")
-	natCipher, _ = ss.NewCipher(ss.TestCipher, "test password")
+	natCryptoKey, _ = shadowsocks.NewEncryptionKey(shadowsocks.CHACHA20IETFPOLY1305, "test password")
 }
 
-type packet struct {
+type fakePacket struct {
 	addr    net.Addr
 	payload []byte
 	err     error
 }
 
+type packetListener struct {
+	conn net.PacketConn
+}
+
+func (ln *packetListener) ListenPacket(ctx context.Context) (net.PacketConn, error) {
+	return ln.conn, nil
+}
+
+func WrapWithValidatingPacketListener(conn net.PacketConn, targetIPValidator onet.TargetIPValidator) transport.PacketListener {
+	return &packetListener{
+		&validatingPacketConn{
+			PacketConn:        conn,
+			targetIPValidator: targetIPValidator,
+		},
+	}
+}
+
 type fakePacketConn struct {
 	net.PacketConn
-	send     chan packet
-	recv     chan packet
+	send     chan fakePacket
+	recv     chan fakePacket
 	deadline time.Time
+	mu       sync.Mutex
 }
 
 func makePacketConn() *fakePacketConn {
 	return &fakePacketConn{
-		send: make(chan packet, 1),
-		recv: make(chan packet),
+		send: make(chan fakePacket, 1),
+		recv: make(chan fakePacket),
 	}
 }
 
+func (conn *fakePacketConn) getReadDeadline() time.Time {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.deadline
+}
+
 func (conn *fakePacketConn) SetReadDeadline(deadline time.Time) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	conn.deadline = deadline
 	return nil
 }
 
 func (conn *fakePacketConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
-	conn.send <- packet{addr, payload, nil}
-	return len(payload), nil
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	var err error
+	defer func() {
+		if recover() != nil {
+			err = net.ErrClosed
+		}
+	}()
+
+	conn.send <- fakePacket{addr, payload, nil}
+	return len(payload), err
 }
 
 func (conn *fakePacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 	pkt, ok := <-conn.recv
 	if !ok {
-		return 0, nil, errors.New("Receive closed")
+		return 0, nil, net.ErrClosed
 	}
 	n := copy(buffer, pkt.payload)
 	if n < len(pkt.payload) {
-		return n, pkt.addr, errors.New("Buffer was too short")
+		return n, pkt.addr, io.ErrShortBuffer
 	}
 	return n, pkt.addr, pkt.err
 }
 
 func (conn *fakePacketConn) Close() error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	close(conn.send)
 	close(conn.recv)
 	return nil
 }
 
+func (conn *fakePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 9999}
+}
+
+func (conn *fakePacketConn) RemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 8888}
+}
+
 type udpReport struct {
-	clientLocation, accessKey, status  string
-	clientProxyBytes, proxyTargetBytes int
+	accessKey, status                  string
+	clientProxyBytes, proxyTargetBytes int64
 }
 
 // Stub metrics implementation for testing NAT behaviors.
 type natTestMetrics struct {
-	metrics.ShadowsocksMetrics
 	natEntriesAdded int
-	upstreamPackets []udpReport
 }
 
-func (m *natTestMetrics) AddTCPProbe(clientLocation, status, drainResult string, port int, data metrics.ProxyMetrics) {
-}
-func (m *natTestMetrics) AddClosedTCPConnection(clientLocation, accessKey, status string, data metrics.ProxyMetrics, timeToCipher, duration time.Duration) {
-}
-func (m *natTestMetrics) GetLocation(net.Addr) (string, error) {
-	return "", nil
-}
-func (m *natTestMetrics) SetNumAccessKeys(numKeys int, numPorts int) {
-}
-func (m *natTestMetrics) AddOpenTCPConnection(clientLocation string) {
-}
-func (m *natTestMetrics) AddUDPPacketFromClient(clientLocation, accessKey, status string, clientProxyBytes, proxyTargetBytes int, timeToCipher time.Duration) {
-	m.upstreamPackets = append(m.upstreamPackets, udpReport{clientLocation, accessKey, status, clientProxyBytes, proxyTargetBytes})
-}
-func (m *natTestMetrics) AddUDPPacketFromTarget(clientLocation, accessKey, status string, targetProxyBytes, proxyClientBytes int) {
-}
-func (m *natTestMetrics) AddUDPNatEntry() {
+var _ NATMetrics = (*natTestMetrics)(nil)
+
+func (m *natTestMetrics) AddNATEntry() {
 	m.natEntriesAdded++
 }
-func (m *natTestMetrics) RemoveUDPNatEntry() {}
+func (m *natTestMetrics) RemoveNATEntry() {}
 
-// Takes a validation policy, and returns the metrics it
-// generates when localhost access is attempted
-func sendToDiscard(payloads [][]byte, validator onet.TargetIPValidator) *natTestMetrics {
-	ciphers, _ := MakeTestCiphers([]string{"asdf"})
-	cipher := ciphers.SnapshotForClientIP(nil)[0].Value.(*CipherEntry).Cipher
-	clientConn := makePacketConn()
-	metrics := &natTestMetrics{}
-	service := NewUDPService(timeout, ciphers, metrics)
-	service.SetTargetIPValidator(validator)
-	go service.Serve(clientConn)
-
-	// Send one packet to the "discard" port on localhost
-	targetAddr := socks.ParseAddr("127.0.0.1:9")
-	for _, payload := range payloads {
-		plaintext := append(targetAddr, payload...)
-		ciphertext := make([]byte, cipher.SaltSize()+len(plaintext)+cipher.TagSize())
-		ss.Pack(ciphertext, plaintext, cipher)
-		clientConn.recv <- packet{
-			addr: &net.UDPAddr{
-				IP:   net.ParseIP("192.0.2.1"),
-				Port: 54321,
-			},
-			payload: ciphertext,
-		}
-	}
-
-	service.GracefulStop()
-	return metrics
+type fakeUDPAssociationMetrics struct {
+	accessKey       string
+	upstreamPackets []udpReport
+	mu              sync.Mutex
 }
 
-func TestIPFilter(t *testing.T) {
-	// Test both the first-packet and subsequent-packet cases.
-	payloads := [][]byte{[]byte("payload1"), []byte("payload2")}
+var _ UDPAssociationMetrics = (*fakeUDPAssociationMetrics)(nil)
 
-	t.Run("Localhost allowed", func(t *testing.T) {
-		metrics := sendToDiscard(payloads, allowAll)
-		assert.Equal(t, metrics.natEntriesAdded, 1, "Expected 1 NAT entry, not %d", metrics.natEntriesAdded)
+func (m *fakeUDPAssociationMetrics) AddAuthentication(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.accessKey = key
+}
+
+func (m *fakeUDPAssociationMetrics) AddPacketFromClient(status string, clientProxyBytes, proxyTargetBytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.upstreamPackets = append(m.upstreamPackets, udpReport{m.accessKey, status, clientProxyBytes, proxyTargetBytes})
+}
+
+func (m *fakeUDPAssociationMetrics) AddPacketFromTarget(status string, targetProxyBytes, proxyClientBytes int64) {
+}
+
+func (m *fakeUDPAssociationMetrics) AddClose() {}
+
+// sendSSPayload sends a single Shadowsocks packet to the provided connection.
+// The packet is constructed with the given address, cipher, and payload.
+func sendSSPayload(conn *fakePacketConn, addr net.Addr, cipher *shadowsocks.EncryptionKey, payload []byte) {
+	socksAddr := socks.ParseAddr(addr.String())
+	plaintext := append(socksAddr, payload...)
+	ciphertext := make([]byte, cipher.SaltSize()+len(plaintext)+cipher.TagSize())
+	shadowsocks.Pack(ciphertext, plaintext, cipher)
+	conn.recv <- fakePacket{
+		addr:    &clientAddr,
+		payload: ciphertext,
+	}
+}
+
+// startTestHandler creates a new association handler with a fake
+// client and target connection for testing purposes. It also starts a
+// PacketServe goroutine to handle incoming packets on the client connection.
+func startTestHandler() (AssociationHandler, func(target net.Addr, payload []byte), *fakePacketConn) {
+	ciphers, _ := MakeTestCiphers([]string{"asdf"})
+	cipher := ciphers.SnapshotForClientIP(netip.Addr{})[0].Value.(*CipherEntry).CryptoKey
+	handler := NewAssociationHandler(ciphers, nil)
+	clientConn := makePacketConn()
+	targetConn := makePacketConn()
+	handler.SetTargetPacketListener(&packetListener{targetConn})
+	go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+		handler.HandleAssociation(ctx, conn, &fakeUDPAssociationMetrics{})
+	}, &natTestMetrics{})
+	return handler, func(target net.Addr, payload []byte) {
+		sendSSPayload(clientConn, target, cipher, payload)
+	}, targetConn
+}
+
+func TestAssociationCloseWhileReading(t *testing.T) {
+	assoc := &association{
+		pc:         makePacketConn(),
+		clientAddr: &clientAddr,
+		readCh:     make(chan *packet),
+	}
+	go func() {
+		buf := make([]byte, 1024)
+		assoc.Read(buf)
+	}()
+
+	err := assoc.Close()
+
+	assert.NoError(t, err, "Close should not panic or return an error")
+}
+
+func TestAssociationHandler_Handle_IPFilter(t *testing.T) {
+	t.Run("RequirePublicIP blocks localhost", func(t *testing.T) {
+		handler, sendPayload, targetConn := startTestHandler()
+		handler.SetTargetPacketListener(WrapWithValidatingPacketListener(targetConn, onet.RequirePublicIP))
+
+		sendPayload(&localAddr, []byte{1, 2, 3})
+
+		select {
+		case <-targetConn.send:
+			t.Errorf("Expected no packets to be sent")
+		case <-time.After(100 * time.Millisecond):
+			return
+		}
 	})
 
-	t.Run("Localhost not allowed", func(t *testing.T) {
-		metrics := sendToDiscard(payloads, onet.RequirePublicIP)
-		assert.Equal(t, 0, metrics.natEntriesAdded, "Unexpected NAT entry on rejected packet")
-		assert.Equal(t, 2, len(metrics.upstreamPackets), "Expected 2 reports, not %v", metrics.upstreamPackets)
-		for _, report := range metrics.upstreamPackets {
-			assert.Greater(t, report.clientProxyBytes, 0, "Expected nonzero input packet size")
-			assert.Equal(t, 0, report.proxyTargetBytes, "No bytes should be sent due to a disallowed packet")
-			assert.Equal(t, report.accessKey, "id-0", "Unexpected access key: %s", report.accessKey)
+	t.Run("allowAll allows localhost", func(t *testing.T) {
+		handler, sendPayload, targetConn := startTestHandler()
+		handler.SetTargetPacketListener(WrapWithValidatingPacketListener(targetConn, allowAll))
+
+		sendPayload(&localAddr, []byte{1, 2, 3})
+
+		sent := <-targetConn.send
+		if !bytes.Equal([]byte{1, 2, 3}, sent.payload) {
+			t.Errorf("Expected %v, but got %v", []byte{1, 2, 3}, sent.payload)
 		}
 	})
 }
 
 func TestUpstreamMetrics(t *testing.T) {
+	ciphers, _ := MakeTestCiphers([]string{"asdf"})
+	cipher := ciphers.SnapshotForClientIP(netip.Addr{})[0].Value.(*CipherEntry).CryptoKey
+	handler := NewAssociationHandler(ciphers, nil)
+	clientConn := makePacketConn()
+	targetConn := makePacketConn()
+	handler.SetTargetPacketListener(&packetListener{targetConn})
+	metrics := &fakeUDPAssociationMetrics{}
+	go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+		handler.HandleAssociation(ctx, conn, metrics)
+	}, &natTestMetrics{})
+
 	// Test both the first-packet and subsequent-packet cases.
 	const N = 10
-	payloads := make([][]byte, 0)
 	for i := 1; i <= N; i++ {
-		payloads = append(payloads, make([]byte, i))
+		sendSSPayload(clientConn, &targetAddr, cipher, make([]byte, i))
+		<-targetConn.send
 	}
 
-	metrics := sendToDiscard(payloads, allowAll)
-
-	assert.Equal(t, N, len(metrics.upstreamPackets), "Expected %d reports, not %v", N, metrics.upstreamPackets)
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	assert.Equal(t, N, len(metrics.upstreamPackets), "Expected %d reports, not %d", N, len(metrics.upstreamPackets))
 	for i, report := range metrics.upstreamPackets {
-		assert.Equal(t, i+1, report.proxyTargetBytes, "Expected %d payload bytes, not %d", i+1, report.proxyTargetBytes)
+		assert.Equal(t, int64(i+1), report.proxyTargetBytes, "Expected %d payload bytes, not %d", i+1, report.proxyTargetBytes)
 		assert.Greater(t, report.clientProxyBytes, report.proxyTargetBytes, "Expected nonzero input overhead (%d > %d)", report.clientProxyBytes, report.proxyTargetBytes)
 		assert.Equal(t, "id-0", report.accessKey, "Unexpected access key name: %s", report.accessKey)
 		assert.Equal(t, "OK", report.status, "Wrong status: %s", report.status)
@@ -201,163 +298,11 @@ func assertAlmostEqual(t *testing.T, a, b time.Time) {
 	}
 }
 
-func TestNATEmpty(t *testing.T) {
-	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{})
-	if nat.Get("foo") != nil {
-		t.Error("Expected nil value from empty NAT map")
+func assertUDPAddrEqual(t *testing.T, a net.Addr, b *net.UDPAddr) {
+	addr, ok := a.(*net.UDPAddr)
+	if !ok || !addr.IP.Equal(b.IP) || addr.Port != b.Port || addr.Zone != b.Zone {
+		t.Errorf("Mismatched address: %v != %v", a, b)
 	}
-}
-
-func setupNAT() (*fakePacketConn, *fakePacketConn, *natconn) {
-	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{})
-	clientConn := makePacketConn()
-	targetConn := makePacketConn()
-	nat.Add(&clientAddr, clientConn, natCipher, targetConn, "ZZ", "key id")
-	entry := nat.Get(clientAddr.String())
-	return clientConn, targetConn, entry
-}
-
-func TestNATGet(t *testing.T) {
-	_, targetConn, entry := setupNAT()
-	if entry == nil {
-		t.Fatal("Failed to find target conn")
-	}
-	if entry.PacketConn != targetConn {
-		t.Error("Mismatched connection returned")
-	}
-}
-
-func TestNATWrite(t *testing.T) {
-	_, targetConn, entry := setupNAT()
-
-	// Simulate one generic packet being sent
-	buf := []byte{1}
-	entry.WriteTo([]byte{1}, &targetAddr)
-	assertAlmostEqual(t, targetConn.deadline, time.Now().Add(timeout))
-	sent := <-targetConn.send
-	if !bytes.Equal(sent.payload, buf) {
-		t.Errorf("Mismatched payload: %v != %v", sent.payload, buf)
-	}
-	if sent.addr != &targetAddr {
-		t.Errorf("Mismatched address: %v != %v", sent.addr, &targetAddr)
-	}
-}
-
-func TestNATWriteDNS(t *testing.T) {
-	_, targetConn, entry := setupNAT()
-
-	// Simulate one DNS query being sent.
-	buf := []byte{1}
-	entry.WriteTo(buf, &dnsAddr)
-	// DNS-only connections have a fixed timeout of 17 seconds.
-	assertAlmostEqual(t, targetConn.deadline, time.Now().Add(17*time.Second))
-	sent := <-targetConn.send
-	if !bytes.Equal(sent.payload, buf) {
-		t.Errorf("Mismatched payload: %v != %v", sent.payload, buf)
-	}
-	if sent.addr != &dnsAddr {
-		t.Errorf("Mismatched address: %v != %v", sent.addr, &targetAddr)
-	}
-}
-
-func TestNATWriteDNSMultiple(t *testing.T) {
-	_, targetConn, entry := setupNAT()
-
-	// Simulate three DNS queries being sent.
-	buf := []byte{1}
-	entry.WriteTo(buf, &dnsAddr)
-	<-targetConn.send
-	entry.WriteTo(buf, &dnsAddr)
-	<-targetConn.send
-	entry.WriteTo(buf, &dnsAddr)
-	<-targetConn.send
-	// DNS-only connections have a fixed timeout of 17 seconds.
-	assertAlmostEqual(t, targetConn.deadline, time.Now().Add(17*time.Second))
-}
-
-func TestNATWriteMixed(t *testing.T) {
-	_, targetConn, entry := setupNAT()
-
-	// Simulate both non-DNS and DNS packets being sent.
-	buf := []byte{1}
-	entry.WriteTo(buf, &targetAddr)
-	<-targetConn.send
-	entry.WriteTo(buf, &dnsAddr)
-	<-targetConn.send
-	// Mixed DNS and non-DNS connections should have the user-specified timeout.
-	assertAlmostEqual(t, targetConn.deadline, time.Now().Add(timeout))
-}
-
-func TestNATFastClose(t *testing.T) {
-	clientConn, targetConn, entry := setupNAT()
-
-	// Send one DNS query.
-	query := []byte{1}
-	entry.WriteTo(query, &dnsAddr)
-	sent := <-targetConn.send
-	// Send the response.
-	response := []byte{1, 2, 3, 4, 5}
-	received := packet{addr: &dnsAddr, payload: response}
-	targetConn.recv <- received
-	sent, ok := <-clientConn.send
-	if !ok {
-		t.Error("clientConn was closed")
-	}
-	if len(sent.payload) <= len(response) {
-		t.Error("Packet is too short to be shadowsocks-AEAD")
-	}
-	if sent.addr != &clientAddr {
-		t.Errorf("Address mismatch: %v != %v", sent.addr, clientAddr)
-	}
-
-	// targetConn should be scheduled to close immediately.
-	assertAlmostEqual(t, targetConn.deadline, time.Now())
-}
-
-func TestNATNoFastClose_NotDNS(t *testing.T) {
-	clientConn, targetConn, entry := setupNAT()
-
-	// Send one non-DNS packet.
-	query := []byte{1}
-	entry.WriteTo(query, &targetAddr)
-	sent := <-targetConn.send
-	// Send the response.
-	response := []byte{1, 2, 3, 4, 5}
-	received := packet{addr: &targetAddr, payload: response}
-	targetConn.recv <- received
-	sent, ok := <-clientConn.send
-	if !ok {
-		t.Error("clientConn was closed")
-	}
-	if len(sent.payload) <= len(response) {
-		t.Error("Packet is too short to be shadowsocks-AEAD")
-	}
-	if sent.addr != &clientAddr {
-		t.Errorf("Address mismatch: %v != %v", sent.addr, clientAddr)
-	}
-	// targetConn should be scheduled to close after the full timeout.
-	assertAlmostEqual(t, targetConn.deadline, time.Now().Add(timeout))
-}
-
-func TestNATNoFastClose_MultipleDNS(t *testing.T) {
-	clientConn, targetConn, entry := setupNAT()
-
-	// Send two DNS packets.
-	query1 := []byte{1}
-	entry.WriteTo(query1, &dnsAddr)
-	<-targetConn.send
-	query2 := []byte{2}
-	entry.WriteTo(query2, &dnsAddr)
-	<-targetConn.send
-
-	// Send a response.
-	response := []byte{1, 2, 3, 4, 5}
-	received := packet{addr: &dnsAddr, payload: response}
-	targetConn.recv <- received
-	<-clientConn.send
-
-	// targetConn should be scheduled to close after the DNS timeout.
-	assertAlmostEqual(t, targetConn.deadline, time.Now().Add(17*time.Second))
 }
 
 // Implements net.Error
@@ -373,36 +318,227 @@ func (e *fakeTimeoutError) Temporary() bool {
 	return false
 }
 
-func TestNATTimeout(t *testing.T) {
-	_, targetConn, entry := setupNAT()
+func TestTimedPacketConn(t *testing.T) {
+	t.Run("Write", func(t *testing.T) {
+		_, sendPayload, targetConn := startTestHandler()
 
-	// Simulate a non-DNS initial packet.
-	entry.WriteTo([]byte{1}, &targetAddr)
-	<-targetConn.send
-	// Simulate a read timeout.
-	received := packet{err: &fakeTimeoutError{}}
-	before := time.Now()
-	targetConn.recv <- received
-	// Wait for targetConn to close.
-	if _, ok := <-targetConn.send; ok {
-		t.Error("targetConn should be closed due to read timeout")
-	}
-	// targetConn should be closed as soon as the timeout error is received.
-	assertAlmostEqual(t, before, time.Now())
+		buf := []byte{1}
+		sendPayload(&targetAddr, buf)
+
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now().Add(timeout))
+		sent := <-targetConn.send
+		if !bytes.Equal(sent.payload, buf) {
+			t.Errorf("Mismatched payload: %v != %v", sent.payload, buf)
+		}
+		assertUDPAddrEqual(t, sent.addr, &targetAddr)
+	})
+
+	t.Run("WriteDNS", func(t *testing.T) {
+		_, sendPayload, targetConn := startTestHandler()
+
+		// Simulate one DNS query being sent.
+		buf := []byte{1}
+		sendPayload(&dnsAddr, buf)
+
+		// DNS-only connections have a fixed timeout of 17 seconds.
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now().Add(17*time.Second))
+		sent := <-targetConn.send
+		if !bytes.Equal(sent.payload, buf) {
+			t.Errorf("Mismatched payload: %v != %v", sent.payload, buf)
+		}
+		assertUDPAddrEqual(t, sent.addr, &dnsAddr)
+	})
+
+	t.Run("WriteDNSMultiple", func(t *testing.T) {
+		_, sendPayload, targetConn := startTestHandler()
+
+		// Simulate three DNS queries being sent.
+		buf := []byte{1}
+		sendPayload(&dnsAddr, buf)
+		<-targetConn.send
+		sendPayload(&dnsAddr, buf)
+		<-targetConn.send
+		sendPayload(&dnsAddr, buf)
+		<-targetConn.send
+
+		// DNS-only connections have a fixed timeout of 17 seconds.
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now().Add(17*time.Second))
+	})
+
+	t.Run("WriteMixed", func(t *testing.T) {
+		_, sendPayload, targetConn := startTestHandler()
+
+		// Simulate both non-DNS and DNS packets being sent.
+		buf := []byte{1}
+		sendPayload(&targetAddr, buf)
+		<-targetConn.send
+		sendPayload(&dnsAddr, buf)
+		<-targetConn.send
+
+		// Mixed DNS and non-DNS connections should have the user-specified timeout.
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now().Add(timeout))
+	})
+
+	t.Run("FastClose", func(t *testing.T) {
+		ciphers, _ := MakeTestCiphers([]string{"asdf"})
+		cipher := ciphers.SnapshotForClientIP(netip.Addr{})[0].Value.(*CipherEntry).CryptoKey
+		handler := NewAssociationHandler(ciphers, nil)
+		clientConn := makePacketConn()
+		targetConn := makePacketConn()
+		handler.SetTargetPacketListener(&packetListener{targetConn})
+		go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+			handler.HandleAssociation(ctx, conn, &fakeUDPAssociationMetrics{})
+		}, &natTestMetrics{})
+
+		// Send one DNS query.
+		sendSSPayload(clientConn, &dnsAddr, cipher, []byte{1})
+		sent := <-targetConn.send
+		require.Len(t, sent.payload, 1)
+		// Send the response.
+		response := []byte{1, 2, 3, 4, 5}
+		received := fakePacket{addr: &dnsAddr, payload: response}
+		targetConn.recv <- received
+		sent, ok := <-clientConn.send
+		if !ok {
+			t.Error("clientConn was closed")
+		}
+
+		// targetConn should be scheduled to close immediately.
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now())
+	})
+
+	t.Run("NoFastClose_NotDNS", func(t *testing.T) {
+		ciphers, _ := MakeTestCiphers([]string{"asdf"})
+		cipher := ciphers.SnapshotForClientIP(netip.Addr{})[0].Value.(*CipherEntry).CryptoKey
+		handler := NewAssociationHandler(ciphers, nil)
+		clientConn := makePacketConn()
+		targetConn := makePacketConn()
+		handler.SetTargetPacketListener(&packetListener{targetConn})
+		go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+			handler.HandleAssociation(ctx, conn, &fakeUDPAssociationMetrics{})
+		}, &natTestMetrics{})
+
+		// Send one non-DNS packet.
+		sendSSPayload(clientConn, &targetAddr, cipher, []byte{1})
+		sent := <-targetConn.send
+		require.Len(t, sent.payload, 1)
+		// Send the response.
+		response := []byte{1, 2, 3, 4, 5}
+		received := fakePacket{addr: &targetAddr, payload: response}
+		targetConn.recv <- received
+		sent, ok := <-clientConn.send
+		if !ok {
+			t.Error("clientConn was closed")
+		}
+
+		// targetConn should be scheduled to close after the full timeout.
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now().Add(timeout))
+	})
+
+	t.Run("NoFastClose_MultipleDNS", func(t *testing.T) {
+		ciphers, _ := MakeTestCiphers([]string{"asdf"})
+		cipher := ciphers.SnapshotForClientIP(netip.Addr{})[0].Value.(*CipherEntry).CryptoKey
+		handler := NewAssociationHandler(ciphers, nil)
+		clientConn := makePacketConn()
+		targetConn := makePacketConn()
+		handler.SetTargetPacketListener(&packetListener{targetConn})
+		go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+			handler.HandleAssociation(ctx, conn, &fakeUDPAssociationMetrics{})
+		}, &natTestMetrics{})
+
+		// Send two DNS packets.
+		sendSSPayload(clientConn, &dnsAddr, cipher, []byte{1})
+		<-targetConn.send
+		sendSSPayload(clientConn, &dnsAddr, cipher, []byte{2})
+		<-targetConn.send
+
+		// Send a response.
+		response := []byte{1, 2, 3, 4, 5}
+		received := fakePacket{addr: &dnsAddr, payload: response}
+		targetConn.recv <- received
+		<-clientConn.send
+
+		// targetConn should be scheduled to close after the DNS timeout.
+		assertAlmostEqual(t, targetConn.getReadDeadline(), time.Now().Add(17*time.Second))
+	})
+
+	t.Run("Timeout", func(t *testing.T) {
+		_, sendPayload, targetConn := startTestHandler()
+
+		// Simulate a non-DNS initial packet.
+		sendPayload(&targetAddr, []byte{1})
+		<-targetConn.send
+		// Simulate a read timeout.
+		received := fakePacket{err: &fakeTimeoutError{}}
+		before := time.Now()
+		targetConn.recv <- received
+		// Wait for targetConn to close.
+		if _, ok := <-targetConn.send; ok {
+			t.Error("targetConn should be closed due to read timeout")
+		}
+
+		// targetConn should be closed as soon as the timeout error is received.
+		assertAlmostEqual(t, before, time.Now())
+	})
+}
+
+func TestNATMap(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		nm := newNATmap()
+		if nm.Get("foo") != nil {
+			t.Error("Expected nil value from empty NAT map")
+		}
+	})
+
+	t.Run("Add", func(t *testing.T) {
+		nm := newNATmap()
+		addr := &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 1234}
+		assoc1 := &association{}
+
+		nm.Add(addr.String(), assoc1)
+		assert.Equal(t, assoc1, nm.Get(addr.String()), "Get should return the correct connection")
+
+		assoc2 := &association{}
+		nm.Add(addr.String(), assoc2)
+		assert.Equal(t, assoc2, nm.Get(addr.String()), "Adding with the same address should overwrite the entry")
+	})
+
+	t.Run("Get", func(t *testing.T) {
+		nm := newNATmap()
+		addr := &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 1234}
+		assoc := &association{}
+		nm.Add(addr.String(), assoc)
+
+		assert.Equal(t, assoc, nm.Get(addr.String()), "Get should return the correct connection for an existing address")
+
+		addr2 := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5678}
+		assert.Nil(t, nm.Get(addr2.String()), "Get should return nil for a non-existent address")
+	})
+
+	t.Run("Del", func(t *testing.T) {
+		nm := newNATmap()
+		addr := &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 1234}
+		assoc := &association{}
+		nm.Add(addr.String(), assoc)
+
+		nm.Del(addr.String())
+
+		assert.Nil(t, nm.Get(addr.String()), "Get should return nil after deleting the entry")
+	})
 }
 
 // Simulates receiving invalid UDP packets on a server with 100 ciphers.
 func BenchmarkUDPUnpackFail(b *testing.B) {
-	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(100))
+	cipherList, err := MakeTestCiphers(makeTestSecrets(100))
 	if err != nil {
 		b.Fatal(err)
 	}
-	testPayload := ss.MakeTestPayload(50)
+	testPayload := makeTestPayload(50)
 	textBuf := make([]byte, serverUDPBufferSize)
-	testIP := net.ParseIP("192.0.2.1")
+	testIP := netip.MustParseAddr("192.0.2.1")
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		findAccessKeyUDP(testIP, textBuf, testPayload, cipherList)
+		findAccessKeyUDP(testIP, textBuf, testPayload, cipherList, noopLogger())
 	}
 }
 
@@ -410,29 +546,29 @@ func BenchmarkUDPUnpackFail(b *testing.B) {
 // their own cipher and IP address.
 func BenchmarkUDPUnpackRepeat(b *testing.B) {
 	const numCiphers = 100 // Must be <256
-	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(numCiphers))
+	cipherList, err := MakeTestCiphers(makeTestSecrets(numCiphers))
 	if err != nil {
 		b.Fatal(err)
 	}
 	testBuf := make([]byte, serverUDPBufferSize)
 	packets := [numCiphers][]byte{}
-	ips := [numCiphers]net.IP{}
-	snapshot := cipherList.SnapshotForClientIP(nil)
+	ips := [numCiphers]netip.Addr{}
+	snapshot := cipherList.SnapshotForClientIP(netip.Addr{})
 	for i, element := range snapshot {
 		packets[i] = make([]byte, 0, serverUDPBufferSize)
-		plaintext := ss.MakeTestPayload(50)
-		packets[i], err = ss.Pack(make([]byte, serverUDPBufferSize), plaintext, element.Value.(*CipherEntry).Cipher)
+		plaintext := makeTestPayload(50)
+		packets[i], err = shadowsocks.Pack(make([]byte, serverUDPBufferSize), plaintext, element.Value.(*CipherEntry).CryptoKey)
 		if err != nil {
 			b.Error(err)
 		}
-		ips[i] = net.IPv4(192, 0, 2, byte(i))
+		ips[i] = netip.AddrFrom4([4]byte{192, 0, 2, byte(i)})
 	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		cipherNumber := n % numCiphers
 		ip := ips[cipherNumber]
 		packet := packets[cipherNumber]
-		_, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+		_, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList, noopLogger())
 		if err != nil {
 			b.Error(err)
 		}
@@ -442,82 +578,113 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
 // Simulates receiving valid UDP packets from 100 different IP addresses,
 // all using the same cipher.
 func BenchmarkUDPUnpackSharedKey(b *testing.B) {
-	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(1)) // One widely shared key
+	cipherList, err := MakeTestCiphers(makeTestSecrets(1)) // One widely shared key
 	if err != nil {
 		b.Fatal(err)
 	}
 	testBuf := make([]byte, serverUDPBufferSize)
-	plaintext := ss.MakeTestPayload(50)
-	snapshot := cipherList.SnapshotForClientIP(nil)
-	cipher := snapshot[0].Value.(*CipherEntry).Cipher
-	packet, err := ss.Pack(make([]byte, serverUDPBufferSize), plaintext, cipher)
+	plaintext := makeTestPayload(50)
+	snapshot := cipherList.SnapshotForClientIP(netip.Addr{})
+	cryptoKey := snapshot[0].Value.(*CipherEntry).CryptoKey
+	packet, err := shadowsocks.Pack(make([]byte, serverUDPBufferSize), plaintext, cryptoKey)
+	require.Nil(b, err)
 
 	const numIPs = 100 // Must be <256
-	ips := [numIPs]net.IP{}
+	ips := [numIPs]netip.Addr{}
 	for i := 0; i < numIPs; i++ {
-		ips[i] = net.IPv4(192, 0, 2, byte(i))
+		ips[i] = netip.AddrFrom4([4]byte{192, 0, 2, byte(i)})
 	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		ip := ips[n%numIPs]
-		_, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+		_, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList, noopLogger())
 		if err != nil {
 			b.Error(err)
 		}
 	}
 }
 
-func TestUDPDoubleServe(t *testing.T) {
-	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(1))
+func TestUDPEarlyClose(t *testing.T) {
+	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	testMetrics := &natTestMetrics{}
 	const testTimeout = 200 * time.Millisecond
-	s := NewUDPService(testTimeout, cipherList, testMetrics)
+	handler := NewAssociationHandler(cipherList, &fakeShadowsocksMetrics{})
+	handler.SetTargetPacketListener(&packetListener{makePacketConn()})
 
-	c := make(chan error)
-	for i := 0; i < 2; i++ {
-		clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-		if err != nil {
-			t.Fatalf("ListenUDP failed: %v", err)
-		}
-		go func() {
-			err := s.Serve(clientConn)
-			if err != nil {
-				c <- err
-				close(c)
-			}
-		}()
-	}
-
-	err = <-c
-	if err == nil {
-		t.Error("Expected an error from one of the two Serve calls")
-	}
-
-	if err := s.Stop(); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestUDPEarlyStop(t *testing.T) {
-	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	testMetrics := &natTestMetrics{}
-	const testTimeout = 200 * time.Millisecond
-	s := NewUDPService(testTimeout, cipherList, testMetrics)
-
-	if err := s.Stop(); err != nil {
-		t.Error(err)
-	}
 	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP failed: %v", err)
 	}
-	if err := s.Serve(clientConn); err != nil {
-		t.Error(err)
+	require.Nil(t, clientConn.Close())
+	// This should return quickly without timing out.
+	go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+		handler.HandleAssociation(ctx, conn, &fakeUDPAssociationMetrics{})
+	}, &natTestMetrics{})
+}
+
+// Makes sure the UDP listener returns [io.ErrClosed] on reads and writes after Close().
+func TestClosedUDPListenerError(t *testing.T) {
+	var packetConn net.PacketConn
+	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	require.NoError(t, err)
+	err = packetConn.Close()
+	require.NoError(t, err)
+
+	_, _, err = packetConn.ReadFrom(nil)
+	require.ErrorIs(t, err, net.ErrClosed)
+
+	_, err = packetConn.WriteTo(nil, &net.UDPAddr{})
+	require.ErrorIs(t, err, net.ErrClosed)
+}
+
+func TestAssociationCloseRaceWithPacketServe(t *testing.T) {
+	// Regression test: when the handler calls Close() (which closes readCh
+	// in the old code) while PacketServe's main loop is simultaneously
+	// enqueuing a packet into readCh, the old code panicked with
+	// "send on closed channel".
+	//
+	// The fix changes Close() to close doneCh instead (via sync.Once),
+	// leaving readCh open so the send cannot panic.
+	//
+	// https://github.com/OutlineFoundation/tunnel-server/pull/289
+
+	ciphers, _ := MakeTestCiphers([]string{"asdf"})
+	cipher := ciphers.SnapshotForClientIP(netip.Addr{})[0].Value.(*CipherEntry).CryptoKey
+
+	handler := NewAssociationHandler(ciphers, nil)
+	clientConn := makePacketConn()
+	targetConn := makePacketConn()
+	handler.SetTargetPacketListener(&packetListener{targetConn})
+
+	// Use a handler that reads one packet, then explicitly closes the
+	// connection while more packets are in flight. In the old code Close()
+	// called close(readCh), so a concurrent send from PacketServe's main
+	// loop would panic with "send on closed channel".
+	handlerDone := make(chan struct{})
+	var closeOnce sync.Once
+	go PacketServe(clientConn, func(ctx context.Context, conn net.Conn) {
+		buf := make([]byte, 1024)
+		conn.Read(buf) // Read one packet.
+		conn.Close()   // Close while PacketServe may still enqueue packets.
+		closeOnce.Do(func() { close(handlerDone) })
+	}, &natTestMetrics{})
+
+	// Send the first packet to create the association and let the handler read it.
+	sendSSPayload(clientConn, &targetAddr, cipher, []byte{1})
+	<-handlerDone
+
+	// Now blast more packets from the same client address. PacketServe will
+	// try to enqueue these into the association's readCh while/after Close()
+	// has been called. Before the fix, this would panic.
+	for i := 0; i < 50; i++ {
+		sendSSPayload(clientConn, &targetAddr, cipher, []byte{byte(i)})
 	}
+
+	// Give PacketServe time to process the queued packets.
+	time.Sleep(50 * time.Millisecond)
+
+	// Clean shutdown. If we get here without a panic, the race is fixed.
+	close(clientConn.recv)
 }

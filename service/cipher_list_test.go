@@ -1,4 +1,4 @@
-// Copyright 2018 Jigsaw Operations LLC
+// Copyright 2018 The Outline Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,20 +16,18 @@ package service
 
 import (
 	"math/rand"
-	"net"
+	"net/netip"
 	"testing"
-
-	ss "github.com/Jigsaw-Code/outline-ss-server/shadowsocks"
 )
 
 func BenchmarkLocking(b *testing.B) {
-	var ip net.IP
+	var ip netip.Addr
 
-	ciphers, _ := MakeTestCiphers(ss.MakeTestSecrets(1))
+	ciphers, _ := MakeTestCiphers([]string{"secret"})
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			entries := ciphers.SnapshotForClientIP(nil)
+			entries := ciphers.SnapshotForClientIP(netip.Addr{})
 			ciphers.MarkUsedByClientIP(entries[0], ip)
 		}
 	})
@@ -41,24 +39,24 @@ func BenchmarkSnapshot(b *testing.B) {
 	// Small cipher lists (N~1e3) fit entirely in cache, and are ~10 times
 	// faster to copy (per entry) than very large cipher lists (N~1e5).
 	const N = 1e3
-	ciphers, _ := MakeTestCiphers(ss.MakeTestSecrets(N))
+	ciphers, _ := MakeTestCiphers(makeTestSecrets(N))
 
 	// Shuffling simulates the behavior of a real server, where successive
 	// ciphers are not expected to be nearby in memory.
-	entries := ciphers.SnapshotForClientIP(nil)
+	entries := ciphers.SnapshotForClientIP(netip.Addr{})
 	rand.Shuffle(N, func(i, j int) {
 		entries[i], entries[j] = entries[j], entries[i]
 	})
 	for _, entry := range entries {
 		// Reorder the list to match the shuffle
 		// (actually in reverse, but it doesn't matter).
-		ciphers.MarkUsedByClientIP(entry, nil)
+		ciphers.MarkUsedByClientIP(entry, netip.Addr{})
 	}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			ciphers.SnapshotForClientIP(nil)
+			ciphers.SnapshotForClientIP(netip.Addr{})
 		}
 	})
 }

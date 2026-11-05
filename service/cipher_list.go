@@ -1,4 +1,4 @@
-// Copyright 2018 Jigsaw Operations LLC
+// Copyright 2018 The Outline Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,10 @@ package service
 
 import (
 	"container/list"
-	"net"
+	"net/netip"
 	"sync"
 
-	ss "github.com/Jigsaw-Code/outline-ss-server/shadowsocks"
+	"golang.getoutline.org/sdk/transport/shadowsocks"
 )
 
 // Don't add a tag if it would reduce the salt entropy below this amount.
@@ -29,15 +29,15 @@ const minSaltEntropy = 16
 // The public fields are constant, but lastClientIP is mutable under cipherList.mu.
 type CipherEntry struct {
 	ID            string
-	Cipher        *ss.Cipher
+	CryptoKey     *shadowsocks.EncryptionKey
 	SaltGenerator ServerSaltGenerator
-	lastClientIP  net.IP
+	lastClientIP  netip.Addr
 }
 
 // MakeCipherEntry constructs a CipherEntry.
-func MakeCipherEntry(id string, cipher *ss.Cipher, secret string) CipherEntry {
+func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string) CipherEntry {
 	var saltGenerator ServerSaltGenerator
-	if cipher.SaltSize()-ServerSaltMarkLen >= minSaltEntropy {
+	if cryptoKey.SaltSize()-serverSaltMarkLen >= minSaltEntropy {
 		// Mark salts with a tag for reverse replay protection.
 		saltGenerator = NewServerSaltGenerator(secret)
 	} else {
@@ -47,7 +47,7 @@ func MakeCipherEntry(id string, cipher *ss.Cipher, secret string) CipherEntry {
 	}
 	return CipherEntry{
 		ID:            id,
-		Cipher:        cipher,
+		CryptoKey:     cryptoKey,
 		SaltGenerator: saltGenerator,
 	}
 }
@@ -56,8 +56,8 @@ func MakeCipherEntry(id string, cipher *ss.Cipher, secret string) CipherEntry {
 // snapshotting and moving to front.
 type CipherList interface {
 	// Returns a snapshot of the cipher list optimized for this client IP
-	SnapshotForClientIP(clientIP net.IP) []*list.Element
-	MarkUsedByClientIP(e *list.Element, clientIP net.IP)
+	SnapshotForClientIP(clientIP netip.Addr) []*list.Element
+	MarkUsedByClientIP(e *list.Element, clientIP netip.Addr)
 	// Update replaces the current contents of the CipherList with `contents`,
 	// which is a List of *CipherEntry.  Update takes ownership of `contents`,
 	// which must not be read or written after this call.
@@ -75,12 +75,12 @@ func NewCipherList() CipherList {
 	return &cipherList{list: list.New()}
 }
 
-func matchesIP(e *list.Element, clientIP net.IP) bool {
+func matchesIP(e *list.Element, clientIP netip.Addr) bool {
 	c := e.Value.(*CipherEntry)
-	return clientIP != nil && clientIP.Equal(c.lastClientIP)
+	return clientIP != netip.Addr{} && clientIP == c.lastClientIP
 }
 
-func (cl *cipherList) SnapshotForClientIP(clientIP net.IP) []*list.Element {
+func (cl *cipherList) SnapshotForClientIP(clientIP netip.Addr) []*list.Element {
 	cl.mu.RLock()
 	defer cl.mu.RUnlock()
 	cipherArray := make([]*list.Element, cl.list.Len())
@@ -102,7 +102,7 @@ func (cl *cipherList) SnapshotForClientIP(clientIP net.IP) []*list.Element {
 	return cipherArray
 }
 
-func (cl *cipherList) MarkUsedByClientIP(e *list.Element, clientIP net.IP) {
+func (cl *cipherList) MarkUsedByClientIP(e *list.Element, clientIP netip.Addr) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	cl.list.MoveToFront(e)

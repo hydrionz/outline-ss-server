@@ -15,3 +15,26 @@
 
 # goreleaser temporary files.
 /dist/
+
+# Tools
+/bin/
+
+# Git submodules
+/third_party/maxmind/
+
+# Prometheus
+/data/
+
+# Go task
+/.task/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Custom caddy binary
+/caddy/caddy
+
+# Direnv
+.envrc
+/.direnv

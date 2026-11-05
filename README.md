@@ -1,7 +1,14 @@
 # Outline ss-server
-[![Build Status](https://travis-ci.org/Jigsaw-Code/outline-ss-server.svg?branch=master)](https://travis-ci.org/Jigsaw-Code/outline-ss-server)
 
-This repository has the Shadowsocks service used by Outline servers. It uses components from [go-shadowsocks2](https://github.com/shadowsocks/go-shadowsocks2), and adds a number of improvements to meet the needs of the Outline users.
+[![Build Status](https://github.com/OutlineFoundation/tunnel-server/actions/workflows/go.yml/badge.svg)](https://github.com/OutlineFoundation/tunnel-server/actions/workflows/go.yml?query=branch%3Amaster)
+
+[![Go Report Card](https://goreportcard.com/badge/github.com/OutlineFoundation/tunnel-server)](https://goreportcard.com/report/github.com/OutlineFoundation/tunnel-server)
+[![Go Reference](https://pkg.go.dev/badge/golang.getoutline.org/tunnel-server.svg)](https://pkg.go.dev/golang.getoutline.org/tunnel-server)
+
+[![Mattermost](https://badgen.net/badge/Mattermost/Outline%20Community/blue)](https://community.internetfreedomfestival.org/community/channels/outline-community)
+[![Reddit](https://badgen.net/badge/Reddit/r%2Foutlinevpn/orange)](https://www.reddit.com/r/outlinevpn/)
+
+This repository has the Shadowsocks backend used by the [Outline Server](https://github.com/OutlineFoundation/outline-server).
 
 The Outline Shadowsocks service allows for:
 - Multiple users on a single port.
@@ -14,28 +21,51 @@ The Outline Shadowsocks service allows for:
 
 ![Graphana Dashboard](https://user-images.githubusercontent.com/113565/44177062-419d7700-a0ba-11e8-9621-db519692ff6c.png "Graphana Dashboard")
 
-## Try it!
+## How to run it
 
-Fetch dependencies for this demo:
+Call the `outline-ss-server` command with the recommended flags, [as done by the official Outline Server](https://github.com/OutlineFoundation/outline-server/blob/b2639d09c30a50479eddcd33b84432f57081be0c/src/shadowbox/server/outline_shadowsocks_server.ts#L91-L100):
 ```
-GO111MODULE=off go get github.com/shadowsocks/go-shadowsocks2 github.com/prometheus/prometheus/cmd/...
+outline-ss-server -replay_history=10000 -metrics=127.0.0.1:9091 -config=$CONFIG_YML  -ip_country_db=$COUNTRY_MMDB -ip_asn_db=$ASN_MMDB
 ```
 
+Flags:
+- `replay_history`: Enables replay protection for the last 10000 connections.
+- `metrics`: Where the webserver exposing the Prometheus metrics will listen on. You should specify localhost so it's not accessible from outside the machine, unless you know what you are doing.
+- `config`: The config file with the access keys. See the config example.
+- `ip_country_db`: The IP-Country MMDB file to enable per-country metrics breakdown.
+- `ip_asn_db`: The IP-ASN MMDB file to enable per-country metrics breakdown.
+
+In the example, you can open https://127.0.0.1:9091 on your browser to see the exported Prometheus metrics.
+
+To fetch and update MMDB files from [DB-IP](https://db-ip.com), you can do something like the [update_mmdb.sh from the Outline Server](https://github.com/OutlineFoundation/outline-server/blob/master/src/shadowbox/scripts/update_mmdb.sh).
+
+
+## Full Working Example: Try It!
+
+Download the [Prometheus](https://prometheus.io/download/) binary.
+
+
+### Run the server
 On Terminal 1, from the repository directory, build and start the SS server:
 ```
-go run . -config config_example.yml -metrics localhost:9091
+go run ./cmd/outline-ss-server -config cmd/outline-ss-server/config_example.yml -metrics localhost:9091 --replay_history=10000
 ```
+In production, you may want to specify `-ip_country_db` to get per-country metrics. See [how the Outline Server calls outline-ss-server](https://github.com/OutlineFoundation/outline-server/blob/master/src/shadowbox/server/outline_shadowsocks_server.ts).
 
+
+### Run the Prometheus scraper for metrics collection
 On Terminal 2, start prometheus scraper for metrics collection:
 ```
-$(go env GOPATH)/bin/prometheus --config.file=prometheus_example.yml
+prometheus --config.file=cmd/outline-ss-server/prometheus_example.yml
 ```
 
+### Run the SOCKS-to-Shadowsocks client
 On Terminal 3, start the SS client:
 ```
-$(go env GOPATH)/bin/go-shadowsocks2 -c ss://chacha20-ietf-poly1305:Secret0@:9000 -verbose  -socks localhost:1080
+go run github.com/shadowsocks/go-shadowsocks2@latest -c ss://chacha20-ietf-poly1305:Secret0@:9000 -verbose  -socks localhost:1080
 ```
 
+### Fetch a page over Shadowsocks
 On Terminal 4, fetch a page using the SS client:
 ```
 curl --proxy socks5h://localhost:1080 example.com
@@ -43,6 +73,7 @@ curl --proxy socks5h://localhost:1080 example.com
 
 Stop and restart the client on Terminal 3 with "Secret1" as the password and try to fetch the page again on Terminal 4.
 
+### Check the metrics
 Open http://localhost:9091/metrics and see the exported Prometheus variables.
 
 Open http://localhost:9090/ and see the Prometheus server dashboard.
@@ -57,12 +88,12 @@ iperf3 -s
 
 Start the SS server (listening on port 9000):
 ```
-go run . -config config_example.yml
+go run ./cmd/outline-ss-server -config cmd/outline-ss-server/config_example.yml
 ```
 
 Start the SS tunnel to redirect port 8000 -> localhost:5201 via the proxy on 9000:
 ```
-$(go env GOPATH)/bin/go-shadowsocks2 -c ss://chacha20-ietf-poly1305:Secret0@:9000 -tcptun ":8000=localhost:5201" -udptun ":8000=localhost:5201" -verbose
+go run github.com/shadowsocks/go-shadowsocks2@latest -c ss://chacha20-ietf-poly1305:Secret0@:9000 -tcptun ":8000=localhost:5201" -udptun ":8000=localhost:5201" -verbose
 ```
 
 Test TCP upload (client -> server):
@@ -89,7 +120,7 @@ iperf3 -c localhost -p 8000 --udp -b 0 --reverse
 
 Run the commands above, but start the SS server with
 ```
-$(go env GOPATH)/bin/go-shadowsocks2 -s ss://chacha20-ietf-poly1305:Secret0@:9000 -verbose
+go run github.com/shadowsocks/go-shadowsocks2 -s ss://chacha20-ietf-poly1305:Secret0@:9000 -verbose
 ```
 
 
@@ -111,13 +142,9 @@ You can mix and match the libev and go servers and clients.
 
 ## Tests and Benchmarks
 
-Before running tests, you should first run
+To run the tests and benchmarks, call:
 ```
-git submodule update --init
-```
-to download test data used by the GeoIP metrics tests.  To run all tests, you can use
-```
-go test -v ./...
+go run github.com/go-task/task/v3/cmd/task test
 ```
 
 You can benchmark the cipher finding code with
@@ -132,14 +159,14 @@ You can inspect the CPU or memory profiles with `go tool pprof cpu.prof` or `go 
 We use [GoReleaser](https://goreleaser.com/) to build and upload binaries to our [GitHub releases](https://github.com/Jigsaw-Code/outline-ss-server/releases).
 
 Summary:
-- [Install GoReleaser](https://goreleaser.com/install/).
 - Test the build locally:
   ```
-  goreleaser --rm-dist --snapshot
+  go run github.com/go-task/task/v3/cmd/task release-local
   ```
-- Export an environment variable named `GITHUB_TOKEN` with a repo-scoped GitHub token ([create one here](https://github.com/settings/tokens/new)):
+- Export an environment variable named `GITHUB_TOKEN` with a temporary repo-scoped GitHub token ([create one here](https://github.com/settings/tokens/new)):
   ```bash
-  export GITHUB_TOKEN=yournewtoken
+  read -s -p "Type your Github token:" GITHUB_TOKEN
+  export GITHUB_TOKEN
   ```
 - Create a new tag and push it to GitHub e.g.:
   ```bash
@@ -148,8 +175,10 @@ Summary:
   ```
 - Build and upload:
   ```bash
-  goreleaser
+  go run github.com/go-task/task/v3/cmd/task release
   ```
-- Go to https://github.com/Jigsaw-Code/outline-ss-server/releases, review and publish the release.
+- Go to https://github.com/OutlineFoundation/tunnel-server/releases, review and publish the release.
+
+- Delete the Github token you created for the release on the [Personal Access Tokens page](https://github.com/settings/tokens).
 
 Full instructions in [GoReleaser's Quick Start](https://goreleaser.com/quick-start) (jump to the section starting "You’ll need to export a GITHUB_TOKEN environment variable").
